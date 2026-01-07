@@ -1,8 +1,9 @@
 import time
+import math
 from typing import Optional, Tuple
 
 import numpy as np
-from sympy import prevprime
+from sympy import prevprime, isprime
 
 def get_secure_param(n: int, k: int):
     q = int(prevprime(1 << k))   # prime close to 2^k
@@ -10,6 +11,46 @@ def get_secure_param(n: int, k: int):
     bar_m = 2 * n
     m = bar_m + w
     return n, k, q, w, bar_m, m
+
+def get_secure_param_only_n(n: int, *, min_bits: int = 14):
+    """
+    Compute RLWE/Trapdoor-friendly parameters.
+
+    Constraints:
+      - n is a power of two
+      - q is prime
+      - q ≡ 1 (mod 2n)
+      - k = ceil(log2 q)
+      - w = n*k
+      - bar_m = 2n
+      - m = bar_m + w
+
+    Args:
+        n: ring dimension (power of two)
+        min_bits: minimum bit-length lower bound for q (default 14).
+                  Increase if you want a larger modulus.
+
+    Returns:
+        (n, k, q, w, bar_m, m)
+    """
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError("n must be a positive power of two.")
+
+    modulus = 2 * n
+    start_q = 1 << min_bits
+
+    # smallest t s.t. q = t*(2n) + 1 >= start_q
+    t = (start_q - 1 + modulus - 1) // modulus
+
+    while True:
+        q = t * modulus + 1
+        if isprime(q):
+            k = math.ceil(math.log2(q))
+            w = n * k
+            bar_m = 2 * n
+            m = bar_m + w
+            return n, k, q, w, bar_m, m
+        t += 1
 
 def gen_gadget_G(n: int, k: int, q: int) -> np.ndarray:
     """
@@ -557,7 +598,10 @@ def verify_preimage(
         print("✘ Verification FAILED:  A x ≢ u  (mod q)")
 
 if __name__ == '__main__':
-    n, k, q, w, bar_m, m = get_secure_param(256, 16)
+    # n, k, q, w, bar_m, m = get_secure_param(256, 16)
+
+    n = 256
+    n, k, q, w, bar_m, m = get_secure_param_only_n(n)
 
     for i in range(3):
 
