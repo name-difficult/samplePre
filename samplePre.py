@@ -268,6 +268,93 @@ def samplePre(
     x = (p + y).astype(np.int64)
     return x
 
+def ring_samplePre(
+        A: np.ndarray,
+        R: np.ndarray,
+        U: np.ndarray,
+        S_k: np.ndarray,
+        q: int,
+        *,
+        s: float = 3.0,
+        c: float = 1.0,
+        sigma_t: float = 3.0
+) -> np.ndarray:
+    """
+    Batched SamplePre (engineering version).
+    U: (n,l)  -> X: (m,l) with A@X == U (mod q)
+    """
+    rng = np.random.default_rng()
+
+    A = np.asarray(A, dtype=np.int64)
+    R = np.asarray(R, dtype=np.int64)
+    U = np.asarray(U, dtype=np.int64)
+    S_k = np.asarray(S_k, dtype=np.int64)
+
+    if A.ndim != 2:
+        raise ValueError("A must be 2D.")
+    if R.ndim != 2:
+        raise ValueError("R must be 2D.")
+    if U.ndim != 2:
+        raise ValueError("U must be 2D with shape (n,l).")
+    if q <= 1:
+        raise ValueError("q must be >= 2.")
+    if s <= 0:
+        raise ValueError("s must be positive.")
+    if c < 1.0:
+        raise ValueError("c must be >= 1.0.")
+
+    n, m = A.shape
+    if U.shape[0] != n:
+        raise ValueError(f"U must have shape (n,l); got {U.shape}, expected first dim n={n}.")
+    l = U.shape[1]
+
+    bar_m, w = R.shape
+    if m != bar_m + w:
+        raise ValueError(f"Dimension mismatch: A has m={m}, but R implies bar_m+w={bar_m+w}.")
+    if w % n != 0:
+        raise ValueError(f"w must be divisible by n; got w={w}, n={n}.")
+    k = w // n
+
+    if S_k.shape != (k, k):
+        raise ValueError(f"S_k must have shape (k,k)=({k},{k}), got {S_k.shape}.")
+
+    q64 = np.int64(q)
+
+    # 1) Sample P: (m,l)
+    sigma_p = float(c * s)
+    P = np.rint(rng.normal(loc=0.0, scale=sigma_p, size=(m, l))).astype(np.int64)
+
+    # 2) V = U - A P (mod q): (n,l)
+    AP = (A @ (P % q64)) % q64
+    V = (U % q64 - AP) % q64
+
+    # 3) z0 bit-decomp: (n,k,l)
+    shifts = np.arange(k, dtype=np.int64)  # (k,)
+    z0 = ((V[:, None, :] >> shifts[None, :, None]) & 1).astype(np.int64)  # (n,k,l)
+
+    # 4) t: (n,k,l)
+    if sigma_t is None or sigma_t <= 0.0:
+        t = np.zeros((n, k, l), dtype=np.int64)
+    else:
+        t = np.rint(rng.normal(loc=0.0, scale=float(sigma_t), size=(n, k, l))).astype(np.int64)
+
+    # 5) z_blocks = z0 + t @ S_k^T  (batched over (n,l))
+    #    Do: (n,l,k) @ (k,k) -> (n,l,k) then transpose back to (n,k,l)
+    t_nlk = np.transpose(t, (0, 2, 1))                 # (n,l,k)
+    tSk_nlk = t_nlk @ S_k.T                             # (n,l,k)
+    tSk = np.transpose(tSk_nlk, (0, 2, 1))              # (n,k,l)
+
+    z_blocks = z0 + tSk                                 # (n,k,l)
+    Z = z_blocks.reshape(w, l).astype(np.int64)          # (w,l)
+
+    # 6) Y = [R; I] Z : (m,l)
+    Y0 = (R @ (Z % q64)) % q64                           # (bar_m,l)
+    Y = np.vstack([Y0, Z % q64]).astype(np.int64)        # (m,l)
+
+    # 7) X = P + Y
+    X = (P + Y).astype(np.int64)
+    return X
+
 def deltrap_HI(
         A: np.ndarray,
         R: np.ndarray,
@@ -358,9 +445,6 @@ def deltrap_HI(
         R_prime = ((R_prime + half) % q64) - half
 
     return R_prime
-
-import numpy as np
-from typing import Optional
 
 def samplePre_batch(
         A: np.ndarray,
@@ -559,101 +643,118 @@ def verify_G_trapdoor_H_is_I(A: np.ndarray, R: np.ndarray, G: np.ndarray, q: int
     print("verify A*[R;I] == G (mod q):", ok)
 
 
-def verify_preimage(
-        A: np.ndarray,
-        x: np.ndarray,
-        u: np.ndarray,
-        q: int,
-) -> None:
+
+def verify_preimage(A: np.ndarray, X: np.ndarray, U: np.ndarray, q: int) -> None:
     """
     Verify and PRINT whether:
-        A @ x ≡ u (mod q)
+        A @ X ≡ U (mod q)
 
-    This function does NOT return anything.
-    It prints the verification result directly.
-    (Kept as-is; not optimized.)
+    A: (n,m), X: (m,l) or (m,), U: (n,l) or (n,)
     """
     if q <= 1:
         raise ValueError("q must be >= 2.")
+    q64 = np.int64(q)
 
-    # Use Python ints to avoid overflow
-    A_obj = np.asarray(A, dtype=object)
-    x_obj = np.asarray(x, dtype=object)
-    u_obj = np.asarray(u, dtype=object)
+    A = np.asarray(A, dtype=np.int64) % q64
+    X = np.asarray(X, dtype=np.int64) % q64
+    U = np.asarray(U, dtype=np.int64) % q64
 
-    if A_obj.ndim != 2:
-        raise ValueError("A must be 2D.")
-    if x_obj.ndim != 1 or x_obj.shape[0] != A_obj.shape[1]:
-        raise ValueError("x has incompatible shape.")
-    if u_obj.ndim != 1 or u_obj.shape[0] != A_obj.shape[0]:
-        raise ValueError("u has incompatible shape.")
-
-    r = (A_obj @ x_obj - u_obj) % int(q)
-    r = np.asarray(r, dtype=np.int64)
-
-    ok = np.all(r == 0)
-    if ok:
-        print("✔ Verification PASSED:  A x ≡ u  (mod q)")
-    else:
-        print("✘ Verification FAILED:  A x ≢ u  (mod q)")
+    AX = (A @ X) % q64
+    r = (AX - U) % q64
+    ok = bool(np.all(r == 0))
+    print(f"[Verify] A@X == U (mod q): {ok}")
+    if not ok:
+        idx = np.argwhere(r != 0)[0]
+        if r.ndim == 1:
+            i = int(idx[0])
+            print(f"First mismatch row={i}: AX={int(AX[i])}, U={int(U[i])}")
+        else:
+            i, j = map(int, idx)
+            print(f"First mismatch row={i}, col={j}: AX={int(AX[i,j])}, U={int(U[i,j])}")
 
 if __name__ == '__main__':
-    # n, k, q, w, bar_m, m = get_secure_param(256, 16)
-
     n = 256
+
+    # n, k, q, w, bar_m, m = get_secure_param(256, 16)
     n, k, q, w, bar_m, m = get_secure_param_only_n(n)
 
-    for i in range(3):
-
-        # ---- GenTrap timing
+    # 验证环上的采样
+    A, R, G, S_k = gen_trapdoor_G_trapdoor(n, q, k, bar_m, sigma=3.0)
+    u1 = np.random.default_rng().integers(0, q, size=(n,), dtype=np.int64)
+    u2 = np.random.default_rng().integers(0, q, size=(n,), dtype=np.int64)
+    u3 = np.random.default_rng().integers(0, q, size=(n,), dtype=np.int64)
+    u4 = np.random.default_rng().integers(0, q, size=(n,), dtype=np.int64)
+    # 拼接 U=[u1|u2|u3]
+    U = np.column_stack([u1, u2, u3, u4]).astype(np.int64)
+    # 使用 ring_samplePre生成X
+    for i in range(5):
         t0 = time.perf_counter()
-        A, R, G, S_k = gen_trapdoor_G_trapdoor(n, q, k, bar_m, sigma=3.0)
-        t1 = time.perf_counter()
-        print(f"[gen_trapdoor_G_trapdoor]  {(t1 - t0) * 1000:.3f} ms")
-
-        # Optional checks (not timed)
-        # verify_G_trapdoor_H_is_I(A, R, G, q)
-        # verify_G_S(G, S_k, q)
-
-        rng = np.random.default_rng()
-        u = rng.integers(0, q, size=(n,), dtype=np.int64)
-
-        # ---- samplePre timing
-        t0 = time.perf_counter()
-        x = samplePre(A, R, u, S_k, q, s=3.0, c=1.0, sigma_t=3.0)
-        t1 = time.perf_counter()
-        print(f"[samplePre]  {(t1 - t0) * 1000:.3f} ms")
-
-        # Optional verify (not timed)
-        # verify_preimage(A, x, u, q)
-
-        H_prime = np.eye(n, dtype=np.int64) % np.int64(q)  # 你可以不再需要它
-        A1 = rng.integers(0, q, size=(n, w), dtype=np.int64)
-
-        # t0 = time.perf_counter()
-        # R_prime = deltrap_HI(
-        #     A=A,
-        #     R=R,
-        #     A1=A1,
-        #     G=G,
-        #     S_k=S_k,
-        #     q=q,
-        #     s_prime=3.0,
-        #     c=1.0,
-        #     sigma_t=3.0,
-        #     progress_every=200,   # 可选：打印进度
-        # )
-        # t1 = time.perf_counter()
-        # print(f"[deltrap]  {(t1 - t0) * 1000:.3f} ms")
-
-        t0 = time.perf_counter()
-        R_prime = deltrap_HI_batched(
-            A=A, R=R, A1=A1, G=G, S_k=S_k, q=q,
-            s_prime=3.0, c=1.0, sigma_t=3.0,
-            batch_size=64,
+        X = ring_samplePre(
+            A=A,
+            R=R,
+            U=U,
+            S_k=S_k,
+            q=q,
+            s=3.0,
+            c=1.0,
+            sigma_t=3.0
         )
         t1 = time.perf_counter()
-        print(f"[deltrap_batched]  {(t1 - t0) * 1000:.3f} ms")
+        print(f"[ring_samplePre]  {(t1 - t0) * 1000:.3f} ms")
+        # 验证 AX=U mod q
+        verify_preimage(A, X, U, q)
 
-        # A_prime = np.concatenate([A % q, A1 % q], axis=1).astype(np.int64)
-        # verify_G_trapdoor_H_is_I(A_prime, R_prime, G, q)
+    # for i in range(1):
+    #
+    #     # ---- GenTrap timing
+    #     t0 = time.perf_counter()
+    #     A, R, G, S_k = gen_trapdoor_G_trapdoor(n, q, k, bar_m, sigma=3.0)
+    #     t1 = time.perf_counter()
+    #     print(f"[gen_trapdoor_G_trapdoor]  {(t1 - t0) * 1000:.3f} ms")
+    #
+    #     # Optional checks (not timed)
+    #     # verify_G_trapdoor_H_is_I(A, R, G, q)
+    #     # verify_G_S(G, S_k, q)
+    #
+    #     rng = np.random.default_rng()
+    #     u = rng.integers(0, q, size=(n,), dtype=np.int64)
+    #
+    #     # ---- samplePre timing
+    #     t0 = time.perf_counter()
+    #     x = samplePre(A, R, u, S_k, q, s=3.0, c=1.0, sigma_t=3.0)
+    #     t1 = time.perf_counter()
+    #     print(f"[samplePre]  {(t1 - t0) * 1000:.3f} ms")
+    #
+    #     # Optional verify (not timed)
+    #     # verify_preimage(A, x, u, q)
+    #
+    #     H_prime = np.eye(n, dtype=np.int64) % np.int64(q)  # 你可以不再需要它
+    #     A1 = rng.integers(0, q, size=(n, w), dtype=np.int64)
+    #
+    #     # t0 = time.perf_counter()
+    #     # R_prime = deltrap_HI(
+    #     #     A=A,
+    #     #     R=R,
+    #     #     A1=A1,
+    #     #     G=G,
+    #     #     S_k=S_k,
+    #     #     q=q,
+    #     #     s_prime=3.0,
+    #     #     c=1.0,
+    #     #     sigma_t=3.0,
+    #     #     progress_every=200,   # 可选：打印进度
+    #     # )
+    #     # t1 = time.perf_counter()
+    #     # print(f"[deltrap]  {(t1 - t0) * 1000:.3f} ms")
+    #
+    #     t0 = time.perf_counter()
+    #     R_prime = deltrap_HI_batched(
+    #         A=A, R=R, A1=A1, G=G, S_k=S_k, q=q,
+    #         s_prime=3.0, c=1.0, sigma_t=3.0,
+    #         batch_size=64,
+    #     )
+    #     t1 = time.perf_counter()
+    #     print(f"[deltrap_batched]  {(t1 - t0) * 1000:.3f} ms")
+    #
+    #     # A_prime = np.concatenate([A % q, A1 % q], axis=1).astype(np.int64)
+    #     # verify_G_trapdoor_H_is_I(A_prime, R_prime, G, q)
