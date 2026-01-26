@@ -52,6 +52,35 @@ def get_secure_param_only_n(n: int, *, min_bits: int = 14):
             return n, k, q, w, bar_m, m
         t += 1
 
+def get_secure_param_only_n_min(n: int, *, min_bits: int | None = None, add_bits: int = 0):
+    """
+    If min_bits is None, use min_bits = log2(n) + add_bits (since n is power of two).
+    If you set add_bits=0, this is exactly your idea: min_bits = k_n.
+    """
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError("n must be a positive power of two.")
+
+    k_n = n.bit_length() - 1  # since n is power of two, this equals log2(n)
+
+    if min_bits is None:
+        min_bits = k_n + add_bits
+
+    modulus = 2 * n
+    start_q = 1 << min_bits
+
+    t = (start_q - 1 + modulus - 1) // modulus
+
+    while True:
+        q = t * modulus + 1
+        if isprime(q):
+            k = math.ceil(math.log2(q))
+            w = n * k
+            bar_m = 2 * n
+            m = bar_m + w
+            return n, k, q, w, bar_m, m
+        t += 1
+
+
 def gen_gadget_G(n: int, k: int, q: int) -> np.ndarray:
     """
     G = I_n ⊗ g^T (mod q),  g=(1,2,4,...,2^{k-1})
@@ -673,10 +702,11 @@ def verify_preimage(A: np.ndarray, X: np.ndarray, U: np.ndarray, q: int) -> None
             print(f"First mismatch row={i}, col={j}: AX={int(AX[i,j])}, U={int(U[i,j])}")
 
 if __name__ == '__main__':
-    n = 256
+    n = 128
 
     # n, k, q, w, bar_m, m = get_secure_param(256, 16)
-    n, k, q, w, bar_m, m = get_secure_param_only_n(n)
+    # n, k, q, w, bar_m, m = get_secure_param_only_n(n)
+    n, k, q, w, bar_m, m = get_secure_param_only_n_min(n)
 
     # 验证环上的采样
     A, R, G, S_k = gen_trapdoor_G_trapdoor(n, q, k, bar_m, sigma=3.0)
